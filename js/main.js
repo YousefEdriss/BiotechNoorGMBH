@@ -6,7 +6,11 @@
 'use strict';
 
 document.addEventListener('DOMContentLoaded', () => {
-  initScrollVideo();   /* async — runs on its own */
+  initScrollVideo().catch(err => {
+    console.warn('[Noor] Scroll video failed:', err);
+    const ls = document.getElementById('loadingScreen');
+    if (ls) { ls.style.transition = 'opacity 0.4s'; ls.style.opacity = '0'; setTimeout(() => ls.remove(), 500); }
+  });
   initParticles();
   initReveal();
   initNavbar();
@@ -46,6 +50,9 @@ async function initScrollVideo() {
 
   /* Device pixel ratio — cap at 2 to avoid excessive memory on 4K displays */
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  /* Mobile: detect to reduce frames/resolution and prevent OOM crash.
+     530 frames × 3.52MB = 1.86GB — fine on desktop, fatal on mobile. */
+  const isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth <= 768;
 
   /* ── Ping-pong mapping: scroll 0→½ plays video forward, ½→1 reverses ──
      This doubles the effective frame density per scroll unit and creates
@@ -122,25 +129,29 @@ async function initScrollVideo() {
     vid.addEventListener('loadedmetadata', resolve, { once: true });
   });
 
-  /* Wait for full buffer so all seeks are instant */
-  await new Promise(resolve => {
-    if (vid.readyState >= 4) return resolve();
-    vid.addEventListener('canplaythrough', resolve, { once: true });
-  });
+  /* Wait for full buffer so all seeks are instant.
+     Skip on mobile — canplaythrough may never fire on iOS/Android without user gesture. */
+  if (!isMobile) {
+    await new Promise(resolve => {
+      if (vid.readyState >= 4) return resolve();
+      vid.addEventListener('canplaythrough', resolve, { once: true });
+    });
+  }
 
   /* ── Frame extraction parameters ──
      Source: 1280×734, 60 fps, ~19.8 s (videos 1–4 concatenated in order).
      60 fps source = frames only 16.7 ms apart — extremely smooth motion.
      At 24 fps extraction: ~475 frames × 3.76 MB ≈ 1.79 GB — comfortable.
      Frame blending in the rAF loop fills sub-frame gaps continuously.      */
-  const duration  = vid.duration;
-  const FPS       = 24;  // 24fps = every source frame (videos are 24fps) → 530 frames × 3.52MB ≈ 1.86GB
-  const TOTAL     = Math.round(duration * FPS);
+  const duration = vid.duration;
+  /* Mobile: 4 fps at 640×360 → ~88 frames × 0.88MB ≈ 77MB — safe on any device.
+     Desktop: 24 fps at full res → ~530 frames × 3.52MB ≈ 1.86GB — comfortable. */
+  const FPS   = isMobile ? 4 : 24;
+  const TOTAL = Math.round(duration * FPS);
 
-  /* Capture at the video's native resolution — no upscaling, no blur */
   const cap    = document.createElement('canvas');
-  cap.width    = vid.videoWidth;
-  cap.height   = vid.videoHeight;
+  cap.width    = isMobile ? Math.min(vid.videoWidth,  640) : vid.videoWidth;
+  cap.height   = isMobile ? Math.min(vid.videoHeight, 360) : vid.videoHeight;
   const capCtx = cap.getContext('2d', { alpha: false });
 
   const frames    = [];
@@ -159,7 +170,15 @@ async function initScrollVideo() {
     vid.currentTime = (i / Math.max(1, TOTAL - 1)) * duration;
     await new Promise(r => vid.addEventListener('seeked', r, { once: true }));
     capCtx.drawImage(vid, 0, 0, cap.width, cap.height);
-    frames.push(await createImageBitmap(cap));
+    try {
+      frames.push(await createImageBitmap(cap));
+    } catch (_) {
+      /* Fallback for older iOS/Android: copy to a canvas (same API surface as ImageBitmap) */
+      const fb = document.createElement('canvas');
+      fb.width = cap.width; fb.height = cap.height;
+      fb.getContext('2d').drawImage(cap, 0, 0);
+      frames.push(fb);
+    }
 
     /* Update progress bar */
     if (loadFill) loadFill.style.width = `${Math.round((i + 1) / TOTAL * 100)}%`;
