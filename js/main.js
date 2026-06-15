@@ -79,13 +79,15 @@ async function initScrollVideo() {
   }
 
   /* ── Cover-mode draw helper ──
-     Scales the frame so it fully covers the canvas (like CSS object-fit:cover):
-     the larger scale axis wins, and the frame is centred on the other axis.
-     Works for both portrait source → landscape canvas and vice-versa.    */
+     Scales the frame so it fully covers the canvas (like CSS object-fit:cover).
+     Handles both ImageBitmap (width/height) and HTMLVideoElement (videoWidth/videoHeight). */
   function drawCover(frame) {
-    const scale = Math.max(canvas.width / frame.width, canvas.height / frame.height);
-    const w = frame.width  * scale;
-    const h = frame.height * scale;
+    const fw = frame.videoWidth  || frame.width;
+    const fh = frame.videoHeight || frame.height;
+    if (!fw || !fh) return;
+    const scale = Math.max(canvas.width / fw, canvas.height / fh);
+    const w = fw * scale;
+    const h = fh * scale;
     const x = (canvas.width  - w) / 2;
     const y = (canvas.height - h) / 2;
     ctx.drawImage(frame, x, y, w, h);
@@ -105,6 +107,103 @@ async function initScrollVideo() {
       drawCover(frames[i1]);
       ctx.globalAlpha = 1;
     }
+  }
+
+  /* ══════════════════════════════════════════════════════════════════════════
+     MOBILE PATH — direct currentTime scrubbing (early return)
+     ──────────────────────────────────────────────────────────────────────────
+     Why not frame-extraction on mobile?
+       • 530 frames × 3.52 MB = 1.86 GB  → guaranteed OOM crash on any phone.
+       • Even reduced to 88 frames (4 fps / 640×360) the frame density is so
+         sparse that scrolling looks choppy.
+
+     Why currentTime scrubbing works here:
+       • bg-scrub.mp4 is encoded with -g 1 (every frame is an I-frame / keyframe).
+       • An I-frame seek decodes ONE independent frame — no backward/forward
+         reference chain.  On mobile H.264 hardware decoders this takes ~5–15 ms.
+       • We cap the seek rate with a "seekPending" flag: issue one seek, wait for
+         "seeked" to fire, then issue the next.  The decoder runs at its own pace
+         without a backlog.
+       • Between seeks we draw() on every rAF tick (60 fps) — the canvas always
+         shows the latest decoded frame with zero extra cost.
+       • Resolution stays at native 1280 × 720 — no downsampling.
+       • Memory: ~20 MB video buffer vs 300+ MB for a frame cache.              */
+  if (isMobile) {
+    const vid = document.createElement('video');
+    vid.muted       = true;
+    vid.playsInline = true;
+    vid.preload     = 'auto';
+    Object.assign(vid.style, {
+      position: 'fixed', width: '1px', height: '1px',
+      opacity: '0', pointerEvents: 'none', top: '-9999px'
+    });
+    document.body.appendChild(vid);
+    vid.src = 'assets/video/bg-scrub.mp4';
+    vid.load();
+
+    /* Wait for first frame — readyState ≥ 2 = HAVE_CURRENT_DATA */
+    await new Promise(resolve => {
+      if (vid.readyState >= 2) return resolve();
+      vid.addEventListener('loadeddata', resolve, { once: true });
+      setTimeout(resolve, 8000); /* safety: always show site, even if video stalls */
+    });
+
+    /* Canvas sizing — inline to avoid depending on frames/currentPct
+       which are declared later in the desktop path.                  */
+    const setSize = () => {
+      canvas.width        = Math.round(window.innerWidth  * dpr);
+      canvas.height       = Math.round(window.innerHeight * dpr);
+      canvas.style.width  = window.innerWidth  + 'px';
+      canvas.style.height = window.innerHeight + 'px';
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+    };
+    setSize();
+    window.addEventListener('resize', () => { setSize(); drawCover(vid); }, { passive: true });
+
+    const duration = vid.duration || 22;
+
+    /* Dismiss loading screen */
+    if (loadScreen) {
+      loadScreen.style.transition = 'opacity 0.55s ease';
+      loadScreen.style.opacity    = '0';
+      setTimeout(() => loadScreen.remove(), 600);
+    }
+
+    let targetPct = 0, currentPct = 0;
+    let seekPending = false;
+
+    window.addEventListener('scroll', () => {
+      const max = document.documentElement.scrollHeight - window.innerHeight;
+      targetPct = max > 0 ? Math.max(0, Math.min(1, window.scrollY / max)) : 0;
+    }, { passive: true });
+
+    /* Release the seek lock the instant the decoder finishes — next rAF
+       can then queue the next seek with no artificial delay.              */
+    vid.addEventListener('seeked', () => { seekPending = false; }, { passive: true });
+
+    drawCover(vid); /* paint frame 0 immediately */
+
+    /* rAF loop:
+       1. Lerp currentPct → smooth scroll tracking even with rapid wheel events.
+       2. drawCover(vid) on EVERY tick — always shows the latest decoded frame
+          at 60 fps with zero stutter (we're just blitting the GPU texture).
+       3. Seek only when the decoder is free — this lets the hardware decode
+          as fast as it can without building up a backlog of pending seeks.  */
+    (function renderLoop() {
+      requestAnimationFrame(renderLoop);
+      currentPct += (targetPct - currentPct) * 0.18;
+      drawCover(vid);
+      if (!seekPending) {
+        const t = pingPong(currentPct) * duration;
+        if (Math.abs(t - vid.currentTime) > 0.001) { /* seek whenever position changed */
+          seekPending     = true;
+          vid.currentTime = t;
+        }
+      }
+    })();
+
+    return; /* ── skip frame-extraction desktop path below ── */
   }
 
   /* ── Hidden video element for frame extraction ── */
